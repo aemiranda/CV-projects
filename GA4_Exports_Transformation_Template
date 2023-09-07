@@ -1,0 +1,257 @@
+DECLARE list_of_tables ARRAY<STRING>;
+DECLARE counter INT64 DEFAULT 0;
+DECLARE current_table_name STRING;
+DECLARE full_table_name STRING;
+DECLARE has_column BOOL DEFAULT FALSE;
+
+--Replace "your-project" with the name of your project
+--Replace "your-dataset" with the name of the dataset that the raw extracts are in
+--Replace "your-new-dataset" with the name of the dataset where you want the cleaned tables to go (cane be same as above)
+
+-- Create a list of tables
+EXECUTE IMMEDIATE """
+  SELECT ARRAY_AGG(DISTINCT table_name)
+  FROM `your-project.your-dataset.INFORMATION_SCHEMA.TABLES` 
+  WHERE table_name LIKE 'events_%' 
+    AND REGEXP_CONTAINS(table_name, r'^events_\\d{8}$')
+  """ INTO list_of_tables;
+
+
+-- Conduct transformations on each of the tables in the list
+WHILE counter < ARRAY_LENGTH(list_of_tables) DO
+
+  -- Set the table name for the current iteration of the loop
+  SET current_table_name = list_of_tables[OFFSET(counter)];
+  SET full_table_name = CONCAT('`your-project.your-dataset.', current_table_name, '`');
+
+  -- Now onto the transformations
+  -- First, query all the relevant columns 
+
+  -- Check if is_active_user exists in the table
+  SET has_column = (
+    SELECT COUNT(1) > 0
+    FROM `your-project.your-dataset.INFORMATION_SCHEMA.COLUMNS`
+    WHERE table_name = current_table_name AND column_name = 'is_active_user'
+  );
+
+  -- Execute the appropriate SQL based on the column's existence
+  IF has_column THEN
+      EXECUTE IMMEDIATE FORMAT("""
+        CREATE TEMP TABLE filtered_table AS
+          SELECT 
+            event_date, 
+            event_timestamp, 
+            event_name, 
+            CONCAT(event_date,
+                    ROW_NUMBER() OVER (
+                      ORDER BY event_timestamp DESC)) as event_id,
+            event_params, 
+            event_bundle_sequence_id, 
+            user_id, 
+            user_pseudo_id, 
+            privacy_info.uses_transient_token, 
+            user_properties, 
+            device.category as device_category, 
+            device.mobile_brand_name as device_mobile_brand_name, 
+            device.mobile_model_name as device_mobile_model_name, 
+            device.operating_system as device_operating_system, 
+            device.operating_system_version as device_operating_system_version, 
+            device.language as device_language, 
+            device.is_limited_ad_tracking as device_is_limited_ad_tracking, 
+            device.web_info.browser as device_web_info_browser, 
+            device.web_info.browser_version as device_web_info_browser_version, 
+            device.web_info.hostname as device_web_info_hostname, 
+            geo.*, 
+            traffic_source.name as traffic_source_name, 
+            traffic_source.medium as traffic_source_medium, 
+            traffic_source.source as traffic_source_source, 
+            stream_id, 
+            platform,
+            is_active_user
+          FROM %s;
+          """, full_table_name);
+
+      ELSE
+        EXECUTE IMMEDIATE FORMAT("""
+          CREATE TEMP TABLE filtered_table AS
+            SELECT 
+              event_date, 
+              event_timestamp, 
+              event_name, 
+              CONCAT(event_date,
+                      ROW_NUMBER() OVER (
+                        ORDER BY event_timestamp DESC)) as event_id,
+              event_params, 
+              event_bundle_sequence_id, 
+              user_id, 
+              user_pseudo_id, 
+              privacy_info.uses_transient_token, 
+              user_properties, 
+              device.category as device_category, 
+              device.mobile_brand_name as device_mobile_brand_name, 
+              device.mobile_model_name as device_mobile_model_name, 
+              device.operating_system as device_operating_system, 
+              device.operating_system_version as device_operating_system_version, 
+              device.language as device_language, 
+              device.is_limited_ad_tracking as device_is_limited_ad_tracking, 
+              device.web_info.browser as device_web_info_browser, 
+              device.web_info.browser_version as device_web_info_browser_version, 
+              device.web_info.hostname as device_web_info_hostname, 
+              geo.*, 
+              traffic_source.name as traffic_source_name, 
+              traffic_source.medium as traffic_source_medium, 
+              traffic_source.source as traffic_source_source, 
+              stream_id, 
+              platform      
+            FROM %s;
+            """, full_table_name);
+  END IF;
+
+  -- Second, query and unnest user properties from the temp filtered_table
+  EXECUTE IMMEDIATE"""
+    CREATE TEMP TABLE get_user_prop AS
+      SELECT DISTINCT user_pseudo_id, user_id, prop.key as user_property, 
+        COALESCE(
+            prop.value.string_value,
+              CAST(prop.value.int_value AS string),
+              CAST(prop.value.double_value AS string),
+              CAST(prop.value.float_value AS string)
+            ) AS user_property_value, 
+        DATETIME(TIMESTAMP_MICROS(prop.value.set_timestamp_micros), "America/Los_Angeles") as set_timestamp_LA
+      FROM filtered_table,
+      UNNEST(user_properties) as prop
+      WHERE prop.key != 'user_id'
+      """;
+
+  --Third, clean the user property data and update user_properties table
+  EXECUTE IMMEDIATE """
+    INSERT INTO `your-project.your-new-dataset.user_properties`
+    SELECT new_table.user_pseudo_id, new_table.user_id, new_table.user_property, new_table.user_property_value, new_table.set_timestamp_LA
+    FROM (SELECT *, 
+            RANK() OVER(PARTITION BY user_pseudo_id,  
+                                    user_property,
+                                    user_property_value
+            ORDER BY set_timestamp_LA DESC, user_id DESC) as duplicate_count
+          FROM get_user_prop
+          ) as new_table
+    --Join the old and new versions of user_properties to query rows missing from old table
+    --"Old" is the table to be updated. "New" is table with user properties to appended to "old table"
+    LEFT JOIN `your-project.your-new-dataset.user_properties` as old_table
+      ON new_table.user_pseudo_id        = old_table.user_pseudo_id
+      AND new_table.user_id              = old_table.user_id
+      AND new_table.user_property        = old_table.user_property
+      AND new_table.user_property_value  = old_table.user_property_value
+      AND new_table.set_timestamp_LA     = old_table.set_timestamp_LA
+    WHERE old_table.user_pseudo_id IS NULL 
+      AND duplicate_count = 1
+    """;
+
+  -- Fourth, parse user_properties to ensure only most recent version of ALL properties remain
+  EXECUTE IMMEDIATE """
+    CREATE OR REPLACE TABLE `your-project.your-new-dataset.user_properties` AS
+    SELECT user_pseudo_id, user_id, user_property, user_property_value, set_timestamp_LA
+    FROM (SELECT *, 
+            RANK() OVER(PARTITION BY user_pseudo_id,  
+                                    user_property,
+                                    user_property_value
+            ORDER BY set_timestamp_LA DESC, user_id DESC) as duplicate_count
+          FROM `your-project.your-new-dataset.user_properties`
+          )
+    WHERE duplicate_count = 1
+  """;
+
+  --Fifth, query and unnest event parameters from temp filtered_table
+  EXECUTE IMMEDIATE """
+    INSERT INTO `your-project.your-new-dataset.event_parameters`
+    SELECT event_id, params.key as parameter_key, 
+      COALESCE(
+        params.value.string_value,
+          CAST(params.value.int_value AS string),
+          CAST(params.value.double_value AS string),
+          CAST(params.value.float_value AS string)
+        ) AS parameter_value,
+    FROM filtered_table,
+    UNNEST(event_params) as params
+    """;
+
+  --Sixth, clean up main_events and query remaining columns
+
+  IF has_column THEN  
+    EXECUTE IMMEDIATE """
+      INSERT INTO `your-project.your-new-dataset.main_events`
+      SELECT DATETIME(TIMESTAMP_MICROS(event_timestamp), "America/Los_Angeles") as event_timestamp_LA, 
+        event_name,
+        event_id,
+        event_bundle_sequence_id, 
+        user_id, 
+        user_pseudo_id, 
+        uses_transient_token,
+        device_category,
+        device_mobile_brand_name,
+        device_mobile_model_name, 
+        device_operating_system, 
+        device_operating_system_version, 
+        device_language, 
+        device_is_limited_ad_tracking, 
+        device_web_info_browser, 
+        device_web_info_browser_version, 
+        device_web_info_hostname,
+        continent, 
+        country, 
+        region, 
+        city, 
+        sub_continent, 
+        metro,
+        traffic_source_name, 
+        traffic_source_medium, 
+        traffic_source_source, 
+        stream_id, platform, 
+        is_active_user
+      FROM filtered_table
+      """;
+    ELSE
+      EXECUTE IMMEDIATE """
+      INSERT INTO `your-project.your-new-dataset.main_events`
+      SELECT DATETIME(TIMESTAMP_MICROS(event_timestamp), "America/Los_Angeles") as event_timestamp_LA, 
+        event_name,
+        event_id,
+        event_bundle_sequence_id, 
+        user_id, 
+        user_pseudo_id, 
+        uses_transient_token,
+        device_category,
+        device_mobile_brand_name,
+        device_mobile_model_name, 
+        device_operating_system, 
+        device_operating_system_version, 
+        device_language, 
+        device_is_limited_ad_tracking, 
+        device_web_info_browser, 
+        device_web_info_browser_version, 
+        device_web_info_hostname,
+        continent, 
+        country, 
+        region, 
+        city, 
+        sub_continent, 
+        metro,
+        traffic_source_name, 
+        traffic_source_medium, 
+        traffic_source_source, 
+        stream_id, 
+        platform,
+        NULL as is_active_user      
+      FROM filtered_table
+      """;
+  END IF;
+
+  -- Intermediate tables to drop: filtered_table, get_user_prop
+  EXECUTE IMMEDIATE 'DROP TABLE filtered_table';
+  EXECUTE IMMEDIATE 'DROP TABLE get_user_prop';
+
+  -- Increase the counter so the loop continues to the next table
+  SET counter = counter + 1;
+END WHILE;
+
+
+
